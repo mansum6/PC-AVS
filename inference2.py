@@ -1,101 +1,117 @@
-import cv2
-import torch
-import fractions
-import numpy as np
-from PIL import Image
-import torch.nn.functional as F
-from torchvision import transforms
-from models.models import create_model
-from options.test_options import TestOptions
-from insightface_func.face_detect_crop_multi import Face_detect_crop
-from util.reverse2original import reverse2wholeimage
 import os
-from util.add_watermark import watermark_image
-from util.norm import SpecificNorm
-from parsing_model.model import BiSeNet
+import sys
+sys.path.append('..')
+from options.test_options import TestOptions
+import torch
+from models import create_model
+import data
+import util.util as util
+from tqdm import tqdm
 
-def lcm(a, b): return abs(a * b) / fractions.gcd(a, b) if a and b else 0
 
-transformer_Arcface = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+def video_concat(processed_file_savepath, name, video_names, audio_path):
+    cmd = ['ffmpeg']
+    num_inputs = len(video_names)
+    for video_name in video_names:
+        cmd += ['-i', '\'' + str(os.path.join(processed_file_savepath, video_name + '.mp4'))+'\'',]
 
-def _totensor(array):
-    tensor = torch.from_numpy(array)
-    img = tensor.transpose(0, 1).transpose(0, 2).contiguous()
-    return img.float().div(255)
+    cmd += ['-filter_complex hstack=inputs=' + str(num_inputs),
+            '\'' + str(os.path.join(processed_file_savepath, name+'.mp4')) + '\'', '-loglevel error -y']
+    cmd = ' '.join(cmd)
+    os.system(cmd)
+
+    video_add_audio(name, audio_path, processed_file_savepath)
+
+
+def video_add_audio(name, audio_path, processed_file_savepath):
+    os.system('cp {} {}'.format(audio_path, processed_file_savepath))
+    cmd = ['ffmpeg', '-i', '\'' + os.path.join(processed_file_savepath, name + '.mp4') + '\'',
+                     '-i', audio_path,
+                     '-q:v 0',
+                     '-strict -2',
+                     '\'' + os.path.join(processed_file_savepath, 'av' + name + '.mp4') + '\'',
+                     '-loglevel error -y']
+    cmd = ' '.join(cmd)
+    os.system(cmd)
+
+
+def img2video(dst_path, prefix, video_path):
+    cmd = ['ffmpeg', '-i', '\'' + video_path + '/' + prefix + '%d.jpg'
+           + '\'', '-q:v 0', '\'' + dst_path + '/' + prefix + '.mp4' + '\'', '-loglevel error -y']
+    cmd = ' '.join(cmd)
+    os.system(cmd)
+
+
+def inference_single_audio(opt, path_label, model):
+    #
+    opt.path_label = path_label
+    dataloader = data.create_dataloader(opt)
+    processed_file_savepath = dataloader.dataset.get_processed_file_savepath()
+
+    idx = 0
+    if opt.driving_pose:
+        video_names = ['Input_', 'G_Pose_Driven_', 'Pose_Source_', 'Mouth_Source_']
+    else:
+        video_names = ['Input_', 'G_Fix_Pose_', 'Mouth_Source_']
+    is_mouth_frame = os.path.isdir(dataloader.dataset.mouth_frame_path)
+    if not is_mouth_frame:
+        video_names.pop()
+    save_paths = []
+    for name in video_names:
+        save_path = os.path.join(processed_file_savepath, name)
+        util.mkdir(save_path)
+        save_paths.append(save_path)
+    for data_i in tqdm(dataloader):
+        # print('==============', i, '===============')
+        fake_image_original_pose_a, fake_image_driven_pose_a = model.forward(data_i, mode='inference')
+
+        for num in range(len(fake_image_driven_pose_a)):
+            util.save_torch_img(data_i['input'][num], os.path.join(save_paths[0], video_names[0] + str(idx) + '.jpg'))
+            if opt.driving_pose:
+                util.save_torch_img(fake_image_driven_pose_a[num],
+                         os.path.join(save_paths[1], video_names[1] + str(idx) + '.jpg'))
+                util.save_torch_img(data_i['driving_pose_frames'][num],
+                         os.path.join(save_paths[2], video_names[2] + str(idx) + '.jpg'))
+            else:
+                util.save_torch_img(fake_image_original_pose_a[num],
+                                    os.path.join(save_paths[1], video_names[1] + str(idx) + '.jpg'))
+            if is_mouth_frame:
+                util.save_torch_img(data_i['target'][num], os.path.join(save_paths[-1], video_names[-1] + str(idx) + '.jpg'))
+            idx += 1
+
+    if opt.gen_video:
+        for i, video_name in enumerate(video_names):
+            img2video(processed_file_savepath, video_name, save_paths[i])
+        video_concat(processed_file_savepath, 'concat', video_names, dataloader.dataset.audio_path)
+
+    print('results saved...' + processed_file_savepath)
+    del dataloader
+    return
+
+
+def main():
+
+    opt = TestOptions().parse()
+    opt.isTrain = False
+    torch.manual_seed(0)
+    model = create_model(opt).cuda()
+    model.eval()
+
+    with open(opt.meta_path_vox, 'r') as f:
+        lines = f.read().splitlines()
+
+    for clip_idx, path_label in enumerate(lines):
+        try:
+            assert len(path_label.split()) == 8, path_label
+
+            inference_single_audio(opt, path_label, model)
+
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            print(path_label + '\n')
+            print(str(ex))
+
 
 if __name__ == '__main__':
-    opt = TestOptions().parse()
-
-    start_epoch, epoch_iter = 1, 0
-    crop_size = opt.crop_size
-
-    torch.nn.Module.dump_patches = True
-    if crop_size == 512:
-        opt.which_epoch = 550000
-        opt.name = '512'
-        mode = 'ffhq'
-    else:
-        mode = 'None'
-    
-    model = create_model(opt)
-    model.eval()
-    spNorm =SpecificNorm()
-
-    app = Face_detect_crop(name='antelope', root='./insightface_func/models')
-    app.prepare(ctx_id= 0, det_thresh=0.6, det_size=(640,640),mode=mode)
-
-    with torch.no_grad():
-        pic_a = opt.pic_a_path
-
-        img_a_whole = cv2.imread(pic_a)
-        img_a_align_crop, _ = app.get(img_a_whole,crop_size)
-        img_a_align_crop_pil = Image.fromarray(cv2.cvtColor(img_a_align_crop[0],cv2.COLOR_BGR2RGB)) 
-        img_a = transformer_Arcface(img_a_align_crop_pil)
-        img_id = img_a.view(-1, img_a.shape[0], img_a.shape[1], img_a.shape[2])
-
-        # convert numpy to tensor
-        img_id = img_id.cuda()
-
-        #create latent id
-        img_id_downsample = F.interpolate(img_id, size=(112,112))
-        latend_id = model.netArc(img_id_downsample)
-        latend_id = F.normalize(latend_id, p=2, dim=1)
-
-
-        ############## Forward Pass ######################
-
-        pic_b = opt.pic_b_path
-        img_b_whole = cv2.imread(pic_b)
-
-        img_b_align_crop_list, b_mat_list = app.get(img_b_whole,crop_size)
-        # detect_results = None
-        swap_result_list = []
-        b_align_crop_tenor_list = []
-
-        for b_align_crop in img_b_align_crop_list:
-
-            b_align_crop_tenor = _totensor(cv2.cvtColor(b_align_crop,cv2.COLOR_BGR2RGB))[None,...].cuda()
-
-            swap_result = model(None, b_align_crop_tenor, latend_id, None, True)[0]
-            swap_result_list.append(swap_result)
-            b_align_crop_tenor_list.append(b_align_crop_tenor)
-
-
-        if opt.use_mask:
-            n_classes = 19
-            net = BiSeNet(n_classes=n_classes)
-            net.cuda()
-            save_pth = os.path.join('./parsing_model/checkpoint', '79999_iter.pth')
-            net.load_state_dict(torch.load(save_pth))
-            net.eval()
-        else:
-            net =None
-
-        reverse2wholeimage(b_align_crop_tenor_list,swap_result_list, b_mat_list, crop_size, img_b_whole,  \
-            os.path.join(opt.output_path, 'result_whole_swapmulti.jpg'),opt.no_simswaplogo,pasring_model =net,use_mask=opt.use_mask, norm = spNorm)
-        print(' ')
-
-        print('************ Done ! ************')
+    main()
