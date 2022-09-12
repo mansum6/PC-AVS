@@ -4,10 +4,6 @@ sys.path.append('..')
 from options.test_options import TestOptions
 import torch
 from models import create_model
-import data
-import util.util as util
-from tqdm import tqdm
-
 
 def video_concat(processed_file_savepath, name, video_names, audio_path):
     cmd = ['ffmpeg']
